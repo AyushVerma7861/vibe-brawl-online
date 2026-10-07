@@ -5794,6 +5794,13 @@ function mpInterpolateRemotes(dt) {
     f.speedBuff = fb.speedBuff; f.damageBuff = fb.damageBuff; f.dashBuff = fb.dashBuff;
     f.shield = fb.shield; f.phaseT = fb.phaseT; f.kos = fb.kos;
     f.isPlayer = false;
+
+    /* Move the MODEL, not just the numbers.
+       `updateModelTransform` is normally called by stepFighter — but remote
+       fighters are never stepped on this client, only our own. Without this
+       call their 3D models stay frozen wherever they spawned while the game,
+       and every test that only reads `.pos`, believes they are fighting. */
+    updateModelTransform(f, dt);
   }
 }
 
