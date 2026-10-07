@@ -4885,15 +4885,39 @@ function mpNetPanelStats() {
 
 /* ---------------- rendering ---------------- */
 
+const MP_SCREENS = ['scrMPMenu', 'scrMPQueue', 'scrMPLobby'];
+
+/**
+ * Hide EVERYTHING — our screens and the game's. This is what a running match
+ * wants: nothing drawn over the arena.
+ *
+ * There used to be a single `mpSetScreen(null)` that meant both "hide all" and
+ * "go back to the solo menu", which are opposites. It resolved to the latter,
+ * so pressing READY started the match and then dropped the player onto the
+ * single-player menu with the fight happening behind it.
+ */
+function mpHideAllScreens() {
+  if (typeof showScreen === 'function') showScreen(null);
+  MP_SCREENS.forEach((id) => { const e = mp$(id); if (e) e.classList.remove('on'); });
+}
+
+/** Show one of the multiplayer screens, hiding the game's own screens. */
 function mpSetScreen(which) {
-  /* Order matters: showScreen() walks the whole screen list, and our screens
-     live in that list so the game's own code can hide them. Let it finish
-     first, then apply our own state on top. */
-  if (typeof showScreen === 'function') showScreen(which ? null : 'scrMenu');
-  ['scrMPMenu', 'scrMPQueue', 'scrMPLobby'].forEach((id) => {
+  if (!which) { mpHideAllScreens(); return; }
+  /* Order matters: showScreen() walks the whole screen list and our screens are
+     in that list, so let it finish first, then apply our own state on top. */
+  if (typeof showScreen === 'function') showScreen(null);
+  MP_SCREENS.forEach((id) => {
     const e = mp$(id);
     if (e) e.classList.toggle('on', id === which);
   });
+}
+
+/** Leave multiplayer and hand the player back to the original single-player menu. */
+function mpShowSoloMenu() {
+  MP_SCREENS.forEach((id) => { const e = mp$(id); if (e) e.classList.remove('on'); });
+  if (typeof resetToMenu === 'function') resetToMenu();
+  else if (typeof showScreen === 'function') showScreen('scrMenu');
 }
 
 function mpShowError(msg) {
@@ -5008,6 +5032,22 @@ function mpUpdateHud(state) {
   }
   const cnt = mp$('mpCount');
   if (cnt && state) cnt.textContent = `${state.humanCount || 0} PLAYERS · ${state.botCount || 0} BOTS`;
+
+  /* Belt and braces. While a match is running, NOTHING may be drawn over the
+     arena. There is exactly one place that is meant to guarantee this, and when
+     it got it wrong the fight ran invisibly behind the single-player menu.
+     Re-asserting it on every snapshot makes that failure impossible rather than
+     merely fixed. */
+  if (MP.phase === 'playing') {
+    const stray = ['scrMenu', 'scrChars', 'scrPause', 'scrMPMenu', 'scrMPQueue', 'scrMPLobby']
+      .filter((id) => { const e = mp$(id); return e && e.classList.contains('on'); });
+    if (stray.length) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[mp] hid a screen that was covering the match:', stray.join(', '));
+      }
+      mpHideAllScreens();
+    }
+  }
 
   mpNetPanelStats();
 }
@@ -5282,7 +5322,9 @@ function mpAttach(room) {
        screen until the match actually starts. */
     if (MP.phase !== 'queue') {
       if (MP.phase === 'connecting') mpPhase('lobby');
-      mpSetScreen(m.resumed ? null : 'scrMPLobby');
+      /* a resumed session means we are already mid-match: show nothing */
+      if (m.resumed) mpHideAllScreens();
+      else mpSetScreen('scrMPLobby');
     }
     mpSetHudVisible(false);
     mpOnLobbyState(room.state);
@@ -5448,7 +5490,8 @@ function mpEnterMatch(snap) {
   fighters.forEach((f, i) => { f.isPlayer = true; });
   setNetInputSource((f) => mpCtrlFor(f));
 
-  mpSetScreen(null);
+  /* Nothing may be drawn over the arena once the fight is on. */
+  mpHideAllScreens();
   mpSetHudVisible(true);
   mpShowError('');
   if (typeof buildCards === 'function') buildCards();
@@ -5882,9 +5925,8 @@ MP.actions = {
   /** Fall back to the original single-player menu. */
   solo() {
     MP.actions.leave();
-    mpSetScreen(null);
     mpPhase('offline');
-    if (typeof resetToMenu === 'function') resetToMenu();
+    mpShowSoloMenu();
   },
 };
 
@@ -5903,15 +5945,18 @@ function mpBoot() {
      buttons' own handlers, so we can take the click first. */
   document.addEventListener('click', (e) => {
     if (MP.phase !== 'over' && MP.phase !== 'playing') return;
-    const t = e.target && e.target.closest && e.target.closest('#btnRematch, #btnMenu');
+    const t = e.target && e.target.closest && e.target.closest('#btnRematch, #btnMenu, #pauseBtn');
     if (!t) return;
     e.preventDefault();
     e.stopPropagation();
     if (t.id === 'btnRematch') MP.actions.rematch();
-    else MP.actions.leave();
+    else if (t.id === 'btnMenu') MP.actions.leave();
+    /* #pauseBtn: deliberately swallowed. Pausing is meaningless online — the
+       server does not stop for you, and the pause screen would cover the
+       arena exactly like the bug this file already had once. */
   }, true);
 
-  /* pause is meaningless online — the server does not stop for you */
+  /* the keyboard route into the pause screen must be blocked too */
   window.addEventListener('keydown', (e) => {
     if ((e.code === 'KeyP' || e.code === 'Escape') && (MP.phase === 'playing' || MP.phase === 'over')) {
       e.preventDefault(); e.stopPropagation();
