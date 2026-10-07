@@ -1,0 +1,12 @@
+# Render Blueprint. Optional — you can also fill the form in by hand.
+services:
+  - type: web
+    name: vibe-brawl
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node vibe-brawl-server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
