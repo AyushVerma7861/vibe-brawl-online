@@ -713,8 +713,23 @@ const SIM_EXPORTS = [
  * @param {object} [opts]
  * @param {boolean} [opts.report]  collect every global the game touched
  */
+/**
+ * The game source, read once and kept.
+ *
+ * Every match used to re-read the file from disk. That is slow, and it means a
+ * transient filesystem hiccup at the exact moment someone presses READY takes
+ * the whole room down — which is exactly what happened once, with EPERM, when
+ * the file was momentarily unavailable. The game cannot change while the
+ * process is running, so there is nothing to re-read for.
+ */
+const _sourceCache = new Map();
+function readGameSource(htmlPath) {
+  if (!_sourceCache.has(htmlPath)) _sourceCache.set(htmlPath, fs.readFileSync(htmlPath, 'utf8'));
+  return _sourceCache.get(htmlPath);
+}
+
 function loadSim(htmlPath, opts = {}) {
-  const html = fs.readFileSync(htmlPath, 'utf8');
+  const html = readGameSource(htmlPath);
   const scripts = extractGameScript(html);
   if (!scripts.length) throw new Error(`no inline <script> found in ${htmlPath}`);
 
@@ -845,9 +860,20 @@ const NET = {
   SNAPSHOT_HZ_NORMAL: 20,
   SNAPSHOT_HZ_SLOW: 15,
 
-  /* input hygiene */
-  INPUT_QUEUE_MAX: 4,          // a 3x-rate client cannot build an unbounded backlog
-  INPUTS_PER_SEC_CAP: 240,     // hard flood guard
+  /* Input hygiene.
+     ---------------------------------------------------------------------------
+     INPUT_QUEUE_MAX is a JITTER BUFFER, not a flood guard, and sizing it like a
+     flood guard was a serious bug. The queue naturally holds
+     (one-way latency x send rate) entries — at 250 ms RTT and 60 inputs/s that
+     is ~8, before any jitter at all. Capping it at 4 made the server silently
+     discard roughly half of every player's button presses, while the client
+     predicted using all of them. The result was constant divergence, constant
+     correction, and a character that barely obeyed its owner.
+     48 entries is 0.8 s of slack at 60 Hz: far more than any real link needs,
+     still bounded, and only a genuinely abusive client will reach it.
+     --------------------------------------------------------------------------- */
+  INPUT_QUEUE_MAX: 48,
+  INPUTS_PER_SEC_CAP: 240,     // hard flood guard, separate from the buffer above
 
   /* events */
   EVENT_BATCH_MAX: 64,
@@ -1041,6 +1067,8 @@ class Match {
     this._queues = {};      // slot -> FIFO of {seq, ctrl}, filled by the room
     this._lastCtrl = {};    // slot -> last applied ctrl, so a slow client keeps moving
     this._ackSeq = {};      // slot -> last sequence the sim actually consumed
+    this._poppedAt = {};    // slot -> tick we last consumed an input on
+    this._humanSlots = [];  // slots driven by a person, drained every tick
     this.reset(seed, charIds);
   }
 
@@ -1084,6 +1112,11 @@ class Match {
   setSlotHuman(i, isHuman) {
     const f = this.fighters[i];
     if (f) f.isPlayer = !!isHuman;
+    if (isHuman) {
+      if (this._humanSlots.indexOf(i) === -1) this._humanSlots.push(i);
+    } else {
+      this._humanSlots = this._humanSlots.filter((s) => s !== i);
+    }
   }
 
   /** Points the sim at the room's live input arrays (same array objects). */
@@ -1091,26 +1124,48 @@ class Match {
 
   /** Last input sequence this slot actually consumed. 0 = nothing consumed yet. */
   ackFor(slot) { return (this._ackSeq && this._ackSeq[slot]) >>> 0; }
-  _inputFor(f) {
-    const q = this._queues && this._queues[f.index];
-    if (!q || !q.length) {
-      /* nothing new: hold the last control so a slow client keeps moving
-         instead of stuttering to a halt every other tick */
-      return this._lastCtrl && this._lastCtrl[f.index]
-        ? this._lastCtrl[f.index]
-        : this.sim.blankCtrl();
-    }
+
+  /**
+   * Consume exactly ONE queued input for `slot` this tick, and only once.
+   *
+   * This used to happen implicitly, from inside playerCtrl() — which the game
+   * only calls when the fighter is `active` and the match is not in countdown.
+   * So while a player was knocked out, respawning, or waiting through 3-2-1,
+   * nothing drained their queue: it filled to its cap, the server silently
+   * discarded real button presses, and on respawn the player received a burst
+   * of stale input all at once.
+   *
+   * Measured: the sim ran 60 steps/s but consumed only 38.6 inputs/s, dropping
+   * 168 of 601 presses in ten seconds. That is the "my character barely obeys
+   * me" bug.
+   *
+   * Now it is driven by the tick, not by the game's control flow, so the queue
+   * always drains and never accumulates stale input.
+   */
+  _popInput(slot) {
+    if (this._poppedAt[slot] === this.tick) return;   // already served this tick
+    this._poppedAt[slot] = this.tick;
+    const q = this._queues && this._queues[slot];
+    if (!q || !q.length) return;                      // nothing new; keep last
     const pkt = q.shift();
-    this._lastCtrl = this._lastCtrl || {};
-    this._lastCtrl[f.index] = pkt.ctrl;
-    this._ackSeq = this._ackSeq || {};
-    this._ackSeq[f.index] = pkt.seq;
-    return pkt.ctrl;
+    this._pops = (this._pops || 0) + 1;
+    this._lastCtrl[slot] = pkt.ctrl;
+    this._ackSeq[slot] = pkt.seq;
+  }
+
+  /** What the sim should use for this fighter right now. */
+  _inputFor(f) {
+    this._popInput(f.index);
+    return this._lastCtrl[f.index] || this.sim.blankCtrl();
   }
 
   /** Advances the simulation by exactly one fixed step and collects events. */
   step() {
     const sim = this.sim;
+    /* Drain every human's queue BEFORE the sim runs, whatever it is about to
+       do. The sim may then ignore the input (countdown, knocked out) — that is
+       fine and correct; the important part is that it does not pile up. */
+    for (let i = 0; i < this._humanSlots.length; i++) this._popInput(this._humanSlots[i]);
     sim.physicsEvents.length = 0;
     sim.updatePhysics(NET.DT);
     const evs = sim.physicsEvents;
@@ -1780,8 +1835,15 @@ class BattleRoom extends Room {
     const seq = (msg && msg.s) >>> 0;
     const q = this.inputQueues[slot];
     q.push({ seq, ctrl: this._sanitiseCtrl(msg) });
-    /* keep latency bounded: if a client is running ahead, drop its oldest */
-    if (q.length > NET.INPUT_QUEUE_MAX) q.splice(0, q.length - NET.INPUT_QUEUE_MAX);
+    this.inputsIn = (this.inputsIn || 0) + 1;
+    /* Only reached by a client genuinely sending faster than the sim ticks.
+       Counted, because a silent drop here is invisible from the outside and
+       looks exactly like "my controls do not work". */
+    if (q.length > NET.INPUT_QUEUE_MAX) {
+      const lost = q.length - NET.INPUT_QUEUE_MAX;
+      q.splice(0, lost);
+      this.inputDrops = (this.inputDrops || 0) + lost;
+    }
 
     /* ack: the highest sequence the server has accepted for this slot */
     const p = this.state.players.get(client.sessionId);
@@ -1965,6 +2027,14 @@ app.get('/api/rooms', (req, res) => {
       code, roomId, mode: room.mode, phase: room.phase,
       humans: room.state ? room.state.humanCount : 0,
       bots: room.state ? room.state.botCount : 0,
+      /* diagnostics: if inputDrops climbs, the server is starving a player of
+         their own controls, which is invisible from the client's side */
+      inputsIn: room.inputsIn || 0,
+      inputDrops: room.inputDrops || 0,
+      queueDepth: room.inputQueues.map((q) => q.length),
+      simTick: room.match ? room.match.tick : 0,
+      inputPops: room.match ? (room.match._pops || 0) : 0,
+      uptimeMs: Date.now() - room.createdAt,
     });
   }
   res.json({ rooms: out });

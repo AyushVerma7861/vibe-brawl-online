@@ -5522,6 +5522,11 @@ function mpStep(dt) {
     }
     mpInterpolateRemotes(dt);
     mpSmoothCorrection(dt);
+    /* mpSmoothCorrection just moved our fighter AFTER stepFighter had already
+       placed its model. Re-sync, or the model visibly trails the real position
+       by the size of the correction. */
+    const me = fighters[MP.slot];
+    if (me) updateModelTransform(me, 0);
   } else {
     /* lobby / queue: run the game's own menu simulation so the arena idles
        behind the UI exactly like it does in single player */
@@ -5543,8 +5548,12 @@ function mpPredictLocal(dt) {
   const me = fighters[MP.slot];
   if (!me) return;
 
-  /* read the keyboard/touch exactly as single player would, then send it */
-  const ctrl = localPlayerCtrl(me);
+  /* The server freezes every fighter during 3-2-1 and ignores input, so
+     predicting real movement through the countdown meant your fighter strolled
+     forward and was then yanked back the instant the fight began. Predict the
+     freeze too. (We still SEND the input, so the server's queue stays in step.) */
+  const frozen = Game.countdown > 0;
+  const ctrl = frozen ? blankCtrl() : localPlayerCtrl(me);
   mpCurrentCtrl = ctrl;
 
   const seq = (++mpSeq) >>> 0;
@@ -5692,6 +5701,23 @@ function mpReconcile(mine, snap) {
     }
   }
 
+  /* --- 1b. being knocked around: stop arguing ---
+     We never predict our own hits, so every hit diverges hard. But during
+     hitstun the player has no control anyway, so accepting the server outright
+     costs nothing and removes almost all correction churn — measured at 50 hard
+     snaps in ~6 seconds before this. */
+  const serverHit = mine.hitstun > 0;
+  const weMissedIt = serverHit && me.hitstun <= 0.02;
+  if (serverHit && weMissedIt) {
+    me.pos.set(mine.x, mine.y, mine.z);
+    me.vx = mine.vx; me.vy = mine.vy; me.vz = mine.vz;
+    me.hitstun = mine.hitstun;
+    mpCorr.x = mpCorr.y = mpCorr.z = 0;
+    mpPending.length = 0;          // everything in flight is now meaningless
+    mpStats.hitResyncs = (mpStats.hitResyncs || 0) + 1;
+    return;
+  }
+
   /* --- 2. continuous state: compare against what we predicted --- */
   const ack = mine.ack >>> 0;
   if (!ack) return;
@@ -5727,8 +5753,15 @@ function mpReconcile(mine, snap) {
     return;
   }
 
-  /* Small disagreement — the normal case. Bank it and let it decay. */
+  /* Small disagreement — the normal case. Bank it and let it decay.
+     Clamped: an unbounded offset becomes a permanent invisible drag on the
+     player, which reads as "my character does not go where I push". If the
+     disagreement is genuinely that large, the hard-snap branch above should
+     have taken it, and a bounded pull is the safer failure. */
   mpCorr.x += dx; mpCorr.y += dy; mpCorr.z += dz;
+  const mag = Math.hypot(mpCorr.x, mpCorr.y, mpCorr.z);
+  const CAP = 4.0;
+  if (mag > CAP) { const k = CAP / mag; mpCorr.x *= k; mpCorr.y *= k; mpCorr.z *= k; }
 }
 
 function mpSmoothCorrection(dt) {
